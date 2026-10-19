@@ -1,0 +1,149 @@
+import os
+import tempfile
+import motmetrics as mm
+import numpy as np
+import pandas as pd
+
+
+def clean_mot17_gt(gt_path):
+  """MOT17 gt.txt dosyasından sadece değerlendirmeye alınan yayaları (Class=1, Conf=1) filtreler."""
+  df = pd.read_csv(gt_path, header=None)
+  # Eğer standart 9-10 sütunlu MOT17 GT dosyası ise filtrele (7. sütun Conf==1 ve 8. sütun Class==1)
+  if df.shape[1] >= 8:
+    df = df[(df[6] == 1) & (df[7] == 1)]
+
+  temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
+  df.to_csv(temp_file.name, header=False, index=False)
+  temp_file.close()
+  return temp_file.name
+
+
+def batch_evaluate(gt_dir, models_root_dir, output_excel="MOT17_Sonuclar.xlsx"):
+  mh = mm.metrics.create()
+
+  # Hesaplanacak standart metrikler
+  metrics = [
+      "mota",
+      "idf1",
+      "motp",
+      "idp",
+      "idr",
+      "mostly_tracked",
+      "partially_tracked",
+      "mostly_lost",
+      "num_false_positives",
+      "num_misses",
+      "num_switches",
+      "num_fragmentations",
+      "num_objects",
+      "num_unique_objects",
+  ]
+
+  # 1. GT dosyalarını bir kez yükle ve temizle
+  gt_files = sorted([f for f in os.listdir(gt_dir) if f.endswith(".txt")])
+  gt_data = {}
+  temp_files = []
+
+  print("Ground Truth (GT) dosyaları yükleniyor ve filtreleniyor...")
+  for gf in gt_files:
+    seq_name = os.path.splitext(gf)[0]
+    clean_path = clean_mot17_gt(os.path.join(gt_dir, gf))
+    temp_files.append(clean_path)
+    gt_data[seq_name] = mm.io.loadtxt(
+        clean_path, fmt="mot15-2D", min_confidence=1
+    )
+
+  # Tüm modellerin genel ortalamalarını (OVERALL) tutacak liste
+  overall_comparison_list = []
+
+  # Excel yazıcısını başlat (Her model ayrı sayfada, Genel Kıyaslama ilk sayfada)
+  excel_writer = pd.ExcelWriter(output_excel, engine="openpyxl")
+
+  # 2. Her bir model klasörünü döngüye al
+  model_names = sorted([
+      d
+      for d in os.listdir(models_root_dir)
+      if os.path.isdir(os.path.join(models_root_dir, d))
+  ])
+
+  for model_name in model_names:
+    print(f"\n---> Değerlendiriliyor: {model_name}")
+    model_dir = os.path.join(models_root_dir, model_name)
+
+    accs = []
+    seq_names = []
+
+    for seq_name, gt in gt_data.items():
+      pred_path = os.path.join(model_dir, f"{seq_name}.txt")
+      if not os.path.exists(pred_path):
+        print(f"  [Uyarı] {model_name} içinde {seq_name}.txt bulunamadı, atlanıyor.")
+        continue
+
+      # Model tahmin logunu yükle
+      ts = mm.io.loadtxt(pred_path, fmt="mot15-2D")
+
+      # IoU=0.5 eşiği ile GT ve Model tahminini karşılaştır
+      acc = mm.utils.compare_to_groundtruth(gt, ts, "iou", distth=0.5)
+      accs.append(acc)
+      seq_names.append(seq_name)
+
+    if not accs:
+      continue
+
+    # Tüm videoları ve en altta OVERALL (Genel Ortalama) satırını hesapla
+    summary = mh.compute_many(
+        accs, metrics=metrics, names=seq_names, generate_overall=True
+    )
+
+    # Konsola düzgün formatta yazdır
+    strsummary = mm.io.render_summary(
+        summary, formatters=mh.formatters, namemap=mm.io.motchallenge_metric_names
+    )
+    print(strsummary)
+
+    # Okunabilirlik için yüzdelik metrikleri 100 ile çarp (MOTA, IDF1, MOTP, IDP, IDR)
+    summary_export = summary.copy()
+    for col in ["mota", "idf1", "motp", "idp", "idr"]:
+      if col in summary_export.columns:
+        summary_export[col] = (summary_export[col] * 100).round(2)
+
+    # Sütun isimlerini standart MOTChallenge kısaltmalarına çevir
+    summary_export.rename(columns=mm.io.motchallenge_metric_names, inplace=True)
+
+    # Bu modelin tüm video detaylarını Excel'de kendi sekmesine kaydet
+    sheet_name = model_name[:31]  # Excel sekme adı sınırı
+    summary_export.to_excel(excel_writer, sheet_name=sheet_name)
+
+    # Sadece OVERALL (Genel Ortalama) satırını al ve modele adını vererek ana tabloya ekle
+    overall_row = summary_export.loc[["OVERALL"]].copy()
+    overall_row.index = [model_name]
+    overall_comparison_list.append(overall_row)
+
+  # 3. Tüm modellerin OVERALL (Genel) sonuçlarını tek bir tabloda birleştir
+  if overall_comparison_list:
+    final_comparison_df = pd.concat(overall_comparison_list)
+
+    # En önemli sayfası olarak "Genel_Kiyaslama" sekmesini kaydet
+    final_comparison_df.to_excel(excel_writer, sheet_name="Genel_Kiyaslama")
+    final_comparison_df.to_csv("Genel_Model_Kiyaslamasi.csv")
+
+    print("\n" + "=" * 70)
+    print("TÜM MODELLERİN GENEL ORTALAMA (OVERALL) KIYASLAMASI:")
+    print("=" * 70)
+    print(final_comparison_df.to_string())
+    print(f"\n[BİLGİ] Tüm detaylı tablolar '{output_excel}' dosyasına kaydedildi.")
+
+  excel_writer.close()
+
+  # Geçici GT dosyalarını temizle
+  for tf in temp_files:
+    if os.path.exists(tf):
+      os.remove(tf)
+
+
+if __name__ == "__main__":
+  # Klasör yollarınızı buraya yazın
+  GT_KLASORU = "./gt"
+  MODELLER_KLASORU = "./modeller"
+
+  batch_evaluate(GT_KLASORU, MODELLER_KLASORU, "CBAM_ByteTrack_Kiyaslama.xlsx")
