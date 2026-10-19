@@ -1,59 +1,49 @@
+
+
 import os
 import tempfile
 import motmetrics as mm
-import numpy as np
 import pandas as pd
 
 
-def prepare_and_check_files(gt_path, pred_path, seq_name, model_name):
-  """1.
-
-  GT dosyasından sadece yayaları (Class=1, Conf=1) filtreler.
-  2. Model logundaki 1 frame eksikliğin '0-index' kaymasından mı yoksa gerçek
-  eksiklikten mi kaynaklandığını tespit edip düzeltir.
-  """
-  # GT Yükle ve Filtrele
+def prepare_files(gt_path, pred_path, video_name, model_name):
   gt_df = pd.read_csv(gt_path, header=None)
+  # MOT17 standart filtrelemesi: Sadece Class=1 (Yaya) ve Conf=1 olanları al
   if gt_df.shape[1] >= 8:
     gt_df = gt_df[(gt_df[6] == 1) & (gt_df[7] == 1)]
 
-  # Model Tahmin (Log) Yükle
   pred_df = pd.read_csv(pred_path, header=None)
 
-  gt_min_f, gt_max_f = int(gt_df[0].min()), int(gt_df[0].max())
-  pred_min_f, pred_max_f = int(pred_df[0].min()), int(pred_df[0].max())
+  gt_min, gt_max = int(gt_df[0].min()), int(gt_df[0].max())
+  pred_min, pred_max = int(pred_df[0].min()), int(pred_df[0].max())
 
-  # DURUM 1: Model logu 0. kareden başlıyorsa (Örn: 0..599 vs 1..600) -> Otomatik +1 kaydır
-  if pred_min_f == 0 and gt_min_f == 1:
-    print(
-        f"  [DÜZELTME] {model_name} - {seq_name}: Log 0'dan başlıyor (0..{pred_max_f}). Otomatik +1 eklendi (1..{pred_max_f+1})."
-    )
+  # 0-index kayması varsa (0..599 gibi) otomatik +1 ekle
+  if pred_min == 0 and gt_min == 1:
     pred_df[0] = pred_df[0] + 1
-    pred_min_f, pred_max_f = int(pred_df[0].min()), int(pred_df[0].max())
+    pred_min, pred_max = int(pred_df[0].min()), int(pred_df[0].max())
+    print(f"  [DÜZELTME] {video_name} - {model_name}: Kareler +1 kaydırıldı.")
 
-  # DURUM 2: Gerçekten 1 frame eksikse (Örn: Son kare 599 veya ilk kare 2)
-  if pred_max_f < gt_max_f or pred_min_f > gt_min_f:
+  # Model logunda 1 frame eksikse GT'yi de modelin kare aralığına eşitle (ceza yazmaması için)
+  if pred_max < gt_max or pred_min > gt_min:
     print(
-        f"  [BİLGİ] {model_name} - {seq_name}: GT Kare Aralığı ({gt_min_f}-{gt_max_f}), Model Kare Aralığı ({pred_min_f}-{pred_max_f})."
+        f"  [BİLGİ] {video_name} - {model_name}: GT ({gt_min}-{gt_max}), Model ({pred_min}-{pred_max}) aralığına hizalandı."
     )
-    # İsteğe bağlı: Eğer son kare model tarafından hiç işlenmediği için GT'den de silinsin (cezalandırılmasın) istiyorsanız
-    # aşağıdaki yorum satırını açabilirsiniz. (Standart MOT protokolünde açık bırakılmaz, ortak kareler isterseniz açın):
-    # gt_df = gt_df[(gt_df[0] >= pred_min_f) & (gt_df[0] <= pred_max_f)]
+    gt_df = gt_df[(gt_df[0] >= pred_min) & (gt_df[0] <= pred_max)]
 
-  # Geçici temiz dosyaları oluştur
-  temp_gt = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
-  gt_df.to_csv(temp_gt.name, header=False, index=False)
-  temp_gt.close()
+  t_gt = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
+  gt_df.to_csv(t_gt.name, header=False, index=False)
+  t_gt.close()
 
-  temp_pred = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
-  pred_df.to_csv(temp_pred.name, header=False, index=False)
-  temp_pred.close()
+  t_pred = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
+  pred_df.to_csv(t_pred.name, header=False, index=False)
+  t_pred.close()
 
-  return temp_gt.name, temp_pred.name
+  return t_gt.name, t_pred.name
 
 
-def run_all_evaluations(
-    gt_dir, models_root_dir, output_excel="MOT17_Toplu_Sonuclar.xlsx"
+def evaluate_video_folders(
+    videos_root_dir="./trackers/videolar",
+    output_excel="MOT17_Genel_Sonuclar.xlsx",
 ):
   mh = mm.metrics.create()
   metrics = [
@@ -73,89 +63,83 @@ def run_all_evaluations(
       "num_unique_objects",
   ]
 
-  gt_files = sorted([f for f in os.listdir(gt_dir) if f.endswith(".txt")])
-  model_names = sorted([
+  # Video klasörlerini bul (MOT17-04, MOT17-05 vb.)
+  if not os.path.exists(videos_root_dir):
+    print(f"[HATA] '{videos_root_dir}' klasörü bulunamadı! Yolu kontrol edin.")
+    return
+
+  video_folders = sorted([
       d
-      for d in os.listdir(models_root_dir)
-      if os.path.isdir(os.path.join(models_root_dir, d))
+      for d in os.listdir(videos_root_dir)
+      if os.path.isdir(os.path.join(videos_root_dir, d))
   ])
 
-  overall_comparison_list = []
+  # Klasörler içindeki tüm model isimlerini otomatik tespit et (gt.txt hariç tüm .txt dosyaları)
+  model_names = set()
+  for vf in video_folders:
+    v_path = os.path.join(videos_root_dir, vf)
+    for f in os.listdir(v_path):
+      if f.endswith(".txt") and f.lower() != "gt.txt":
+        model_names.add(os.path.splitext(f)[0])
+  model_names = sorted(list(model_names))
+
+  overall_list = []
   excel_writer = pd.ExcelWriter(output_excel, engine="openpyxl")
 
-  for model_name in model_names:
-    print(f"\n==========================================")
-    print(f"Model İşleniyor: {model_name}")
-    print(f"==========================================")
-    model_dir = os.path.join(models_root_dir, model_name)
+  for model in model_names:
+    print(f"\n---> Model Hesaplanıyor: {model}")
+    accs, seq_names, temp_files = [], [], []
 
-    accs = []
-    seq_names = []
-    temp_files = []
+    for vf in video_folders:
+      v_path = os.path.join(videos_root_dir, vf)
+      gt_path = os.path.join(v_path, "gt.txt")
+      pred_path = os.path.join(v_path, f"{model}.txt")
 
-    for gf in gt_files:
-      seq_name = os.path.splitext(gf)[0]
-      gt_path = os.path.join(gt_dir, gf)
-      pred_path = os.path.join(model_dir, gf)
-
-      if not os.path.exists(pred_path):
-        print(f"  [Uyarı] {pred_path} bulunamadı, bu video atlanıyor.")
+      if not os.path.exists(gt_path) or not os.path.exists(pred_path):
+        print(f"  [Atlandı] {vf} içinde gt.txt veya {model}.txt eksik.")
         continue
 
-      # Frame kontrolü ve temizleme
-      clean_gt_path, clean_pred_path = prepare_and_check_files(
-          gt_path, pred_path, seq_name, model_name
-      )
-      temp_files.extend([clean_gt_path, clean_pred_path])
+      c_gt, c_pred = prepare_files(gt_path, pred_path, vf, model)
+      temp_files.extend([c_gt, c_pred])
 
-      gt = mm.io.loadtxt(clean_gt_path, fmt="mot15-2D", min_confidence=1)
-      ts = mm.io.loadtxt(clean_pred_path, fmt="mot15-2D")
+      gt = mm.io.loadtxt(c_gt, fmt="mot15-2D", min_confidence=1)
+      ts = mm.io.loadtxt(c_pred, fmt="mot15-2D")
 
-      # IoU=0.5 ile eşleştir
       acc = mm.utils.compare_to_groundtruth(gt, ts, "iou", distth=0.5)
       accs.append(acc)
-      seq_names.append(seq_name)
+      seq_names.append(vf)
 
     if accs:
-      # Tüm videoları ve OVERALL ortalamasını tek seferde hesapla
       summary = mh.compute_many(
           accs, metrics=metrics, names=seq_names, generate_overall=True
       )
-
-      summary_export = summary.copy()
       for col in ["mota", "idf1", "motp", "idp", "idr"]:
-        if col in summary_export.columns:
-          summary_export[col] = (summary_export[col] * 100).round(2)
+        if col in summary.columns:
+          summary[col] = (summary[col] * 100).round(2)
 
-      summary_export.rename(
-          columns=mm.io.motchallenge_metric_names, inplace=True
-      )
-      summary_export.to_excel(excel_writer, sheet_name=model_name[:31])
+      summary.rename(columns=mm.io.motchallenge_metric_names, inplace=True)
+      summary.to_excel(excel_writer, sheet_name=model[:31])
 
-      overall_row = summary_export.loc[["OVERALL"]].copy()
-      overall_row.index = [model_name]
-      overall_comparison_list.append(overall_row)
+      overall_row = summary.loc[["OVERALL"]].copy()
+      overall_row.index = [model]
+      overall_list.append(overall_row)
 
-    # Geçici dosyaları sil
     for tf in temp_files:
       if os.path.exists(tf):
         os.remove(tf)
 
-  if overall_comparison_list:
-    final_df = pd.concat(overall_comparison_list)
+  if overall_list:
+    final_df = pd.concat(overall_list)
     final_df.to_excel(excel_writer, sheet_name="Genel_Ortalama_Kiyaslama")
-    print("\n" + "#" * 75)
-    print("TÜM VİDEOLARIN VE MODELLERİN GENEL ORTALAMA (OVERALL) TABLOSU:")
-    print("#" * 75)
+    print("\n" + "=" * 75)
+    print("TÜM MODELLERİN GENEL ORTALAMA (OVERALL) TABLOSU:")
+    print("=" * 75)
     print(final_df.to_string())
-    print(
-        f"\n---> Tablonuz '{output_excel}' olarak tek seferde oluşturuldu!"
-    )
+    print(f"\n[BİLGİ] Sonuçlar başarıyla '{output_excel}' dosyasına kaydedildi.")
 
   excel_writer.close()
 
 
 if __name__ == "__main__":
-  # Sadece bu iki ana klasör yolunu vermeniz yeterli, içindekileri otomatik bulur:
-  run_all_evaluations(gt_dir="./gt", models_root_dir="./modeller")
-
+  # Proje kök dizininden çalıştırıldığı için yol './trackers/videolar' olarak ayarlandı:
+  evaluate_video_folders("./trackers/videolar")
